@@ -1,51 +1,64 @@
 ﻿using Microsoft.Playwright;
 using System.Collections.Concurrent;
 using System.Text;
+using System.Net.Http.Json;
+using Microsoft.Extensions.Configuration;
 
-var zipCodes = new[]
-{
-    "17503", "17504", "17505", "17506", "17507",
-    "17508", "17509", "17512", "17516", "17517",
-    "19188", "19191", "19192", "19193", "19194",
-    "19195", "15313", "15314", "15317", "15321",
-    "15322", "15323", "15324", "15329", "15330"
-};
+var configuration = new ConfigurationBuilder()
+    .SetBasePath(Directory.GetCurrentDirectory())
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+    .Build();
 
-const string TargetRateSchedule = "Regular Residential Service";
-const string HomeUrl = "https://www.papowerswitch.com/";
+string baseApiUrl = configuration["ScraperSettings:BaseApiUrl"] ?? "https://localhost:32768";
+string stateToProcess = configuration["ScraperSettings:StateToProcess"] ?? "PA";
+string targetRateSchedule = configuration["ScraperSettings:TargetRateSchedule"] ?? "Regular Residential Service";
+string homeUrl = configuration["ScraperSettings:HomeUrl"] ?? "https://www.papowerswitch.com/";
+int maxConcurrency = int.TryParse(configuration["ScraperSettings:MaxConcurrency"], out var parsedMax) ? parsedMax : 5;
 
-// ---- Concurrency tuning -----------------------------------------------
-// How many zip codes are processed at the same time. Each "slot" is an
-// isolated BrowserContext + Page inside a single shared Chromium process.
-// Start around 4-6. Push higher only if the site tolerates it and your
-// machine has the CPU/RAM to spare; too high risks throttling/blocking
-// or flaky selectors due to contention.
-const int MaxConcurrency = 5;
-// -------------------------------------------------------------------------
-
-// Thread-safe collector for CSV rows (StringBuilder is NOT thread-safe).
 var csvRows = new ConcurrentBag<string>();
+using var httpClient = new HttpClient { BaseAddress = new Uri(baseApiUrl), Timeout = TimeSpan.FromSeconds(30) };
+
+Console.WriteLine($"Fetching active customer leads for state: {stateToProcess}...");
+List<CustomerLeadDto> customerLeads;
+
+try
+{
+    var response = await httpClient.GetFromJsonAsync<List<CustomerLeadDto>>($"api/PTCPricingProcess/state/{stateToProcess}");
+    customerLeads = response ?? new List<CustomerLeadDto>();
+
+    if (!customerLeads.Any())
+    {
+        Console.WriteLine("No customer leads found for this state. Exiting process.");
+        return;
+    }
+
+    Console.WriteLine($"Found {customerLeads.Count} unique Zip/Utility combinations to process.");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Failed to retrieve zip codes from API: {ex.Message}");
+    return;
+}
 
 try
 {
     using var playwright = await Playwright.CreateAsync();
 
-    // One shared browser process; contexts give us per-zip isolation
-    // (separate cookies/localStorage/cache) without the overhead of
-    // spinning up N full Chromium instances.
     await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
     {
-        Headless = true // headless is strongly recommended once running in parallel
+        Headless = true
     });
 
-    using var throttle = new SemaphoreSlim(MaxConcurrency);
+    using var throttle = new SemaphoreSlim(maxConcurrency);
 
-    var tasks = zipCodes.Select(async zip =>
+    var uniqueZipCodes = customerLeads.Select(x => x.ZipCode).Distinct().ToList();
+
+    var tasks = uniqueZipCodes.Select(async zip =>
     {
         await throttle.WaitAsync();
         try
         {
-            await ProcessZipAsync(browser, zip, csvRows, TargetRateSchedule);
+            await ProcessZipAsync(browser, zip, csvRows, targetRateSchedule, homeUrl, httpClient);
         }
         catch (Exception zipEx)
         {
@@ -86,10 +99,8 @@ finally
     }
 }
 
-async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> csvRows, string targetRateSchedule)
+async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> csvRows, string targetRate, string targetUrl, HttpClient apiHttpClient)
 {
-    // Each zip gets its own context + page so parallel runs don't share
-    // cookies/session state and don't fight over the same page instance.
     await using var context = await browser.NewContextAsync();
     var page = await context.NewPageAsync();
 
@@ -107,10 +118,10 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
             {
                 Console.WriteLine($"Processing {zip}, EDC #{distributorIndex + 1} (attempt {attempt})");
 
-                await page.GotoAsync(HomeUrl, new PageGotoOptions
+                await page.GotoAsync(targetUrl, new PageGotoOptions
                 {
                     WaitUntil = WaitUntilState.Load,
-                    Timeout = 30000
+                    Timeout = 45000
                 });
 
                 var zipInput = page.Locator("#zipcode-input");
@@ -123,9 +134,7 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
                 {
                     await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions { Timeout = 5000 });
                 }
-                catch
-                {
-                }
+                catch { }
 
                 await Task.Delay(1500);
 
@@ -139,7 +148,6 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
                 }
 
                 await next1.ClickAsync(new LocatorClickOptions { Force = true });
-
                 await Task.Delay(1000);
 
                 var step2 = page.Locator("#step2");
@@ -158,7 +166,6 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
                         radiosFound = true;
                         break;
                     }
-
                     await Task.Delay(500);
                 }
 
@@ -172,7 +179,6 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
                         totalDistributors = 0;
                         break;
                     }
-
                     throw new Exception("Neither EDC radios nor 'no EDC' message appeared on step 2 after full wait.");
                 }
 
@@ -196,7 +202,6 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
                 }
 
                 await chosenEdcRadio.CheckAsync(new LocatorCheckOptions { Force = true });
-
                 Console.WriteLine($"  Selected EDC: {(string.IsNullOrWhiteSpace(edcLabel) ? "(unlabeled)" : edcLabel)} ({distributorIndex + 1}/{totalDistributors})");
 
                 var next2 = page.Locator("#next2");
@@ -236,7 +241,7 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
                     if (await labelLoc.CountAsync() == 0) continue;
 
                     var labelText = await labelLoc.InnerTextAsync();
-                    if (labelText.Contains(targetRateSchedule, StringComparison.OrdinalIgnoreCase))
+                    if (labelText.Contains(targetRate, StringComparison.OrdinalIgnoreCase))
                     {
                         matchingRateRadio = await opt.ElementHandleAsync();
                         matchingRateLabel = labelText;
@@ -246,7 +251,7 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
 
                 if (matchingRateRadio == null)
                 {
-                    Console.WriteLine($"  '{targetRateSchedule}' not offered for {zip} / {edcLabel} - skipping this EDC");
+                    Console.WriteLine($"  '{targetRate}' not offered for {zip} / {edcLabel} - skipping this EDC");
                     success = true;
                     distributorIndex++;
                     continue;
@@ -258,7 +263,7 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
                 var next3 = page.Locator("#next3");
                 await next3.ClickAsync();
 
-                await page.WaitForURLAsync("**/shop-for-rates-results/**", new PageWaitForURLOptions { Timeout = 20000 });
+                await page.WaitForURLAsync("**/shop-for-rates-results/**", new PageWaitForURLOptions { Timeout = 30000 });
 
                 bool hasDistCard;
                 try
@@ -277,7 +282,7 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
 
                 if (hasDistCard)
                 {
-                    await ScrapeCurrentPriceToCompareAsync(page, zip, csvRows);
+                    await ScrapeAndSavePriceAsync(page, zip, csvRows, apiHttpClient);
                     zipHadAnyOffers = true;
                 }
                 else
@@ -302,9 +307,7 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
                             FullPage = true
                         });
                     }
-                    catch
-                    {
-                    }
+                    catch { }
                 }
                 else
                 {
@@ -324,7 +327,7 @@ async Task ProcessZipAsync(IBrowser browser, string zip, ConcurrentBag<string> c
     await context.CloseAsync();
 }
 
-async Task ScrapeCurrentPriceToCompareAsync(IPage page, string zip, ConcurrentBag<string> csvRows)
+async Task ScrapeAndSavePriceAsync(IPage page, string zip, ConcurrentBag<string> csvRows, HttpClient apiHttpClient)
 {
     try
     {
@@ -341,9 +344,7 @@ async Task ScrapeCurrentPriceToCompareAsync(IPage page, string zip, ConcurrentBa
                 var fallback = await distCard.Locator(".company-info.dist .name").First.TextContentAsync();
                 utility = (fallback ?? "").Trim();
             }
-            catch
-            {
-            }
+            catch { }
         }
 
         if (string.IsNullOrEmpty(rateSchedule))
@@ -353,12 +354,10 @@ async Task ScrapeCurrentPriceToCompareAsync(IPage page, string zip, ConcurrentBa
                 var fallback = await distCard.Locator(".company-info.dist .rate-schedule").First.TextContentAsync();
                 rateSchedule = (fallback ?? "").Trim();
             }
-            catch
-            {
-            }
+            catch { }
         }
 
-        string perKwh = "";
+        string perKwhText = "";
         try
         {
             var perKwhBlock = distCard.Locator(".data-wrap.number")
@@ -368,14 +367,12 @@ async Task ScrapeCurrentPriceToCompareAsync(IPage page, string zip, ConcurrentBa
             if (await perKwhBlock.CountAsync() > 0)
             {
                 var text = await perKwhBlock.Locator(".highlight.large").First.TextContentAsync();
-                perKwh = (text ?? "").Replace("$", "").Trim();
+                perKwhText = (text ?? "").Replace("$", "").Trim();
             }
         }
-        catch
-        {
-        }
+        catch { }
 
-        string estimatedMonthly = "";
+        string estimatedMonthlyText = "";
         try
         {
             var monthlyBlock = distCard.Locator(".data-wrap.number")
@@ -385,27 +382,74 @@ async Task ScrapeCurrentPriceToCompareAsync(IPage page, string zip, ConcurrentBa
             if (await monthlyBlock.CountAsync() > 0)
             {
                 var text = await monthlyBlock.Locator(".highlight.large").First.TextContentAsync();
-                estimatedMonthly = (text ?? "").Replace("$", "").Trim();
+                estimatedMonthlyText = (text ?? "").Replace("$", "").Trim();
             }
         }
-        catch
-        {
-        }
+        catch { }
 
-        string lastUpdated = "";
+        string lastUpdatedText = "";
         try
         {
-            var lastUpdatedText = await distCard.Locator(".last-updated").First.TextContentAsync();
-            lastUpdated = (lastUpdatedText ?? "").Replace("Rate last updated on", "").Trim();
+            var lastUpdatedContent = await distCard.Locator(".last-updated").First.TextContentAsync();
+            lastUpdatedText = (lastUpdatedContent ?? "").Replace("Rate last updated on", "").Trim();
         }
-        catch
+        catch { }
+
+        csvRows.Add($"\"{utility}\",\"{zip}\",\"{rateSchedule}\",\"{perKwhText}\",\"{estimatedMonthlyText}\",\"{lastUpdatedText}\"");
+
+        decimal.TryParse(perKwhText, out decimal pricePerKwh);
+        decimal.TryParse(estimatedMonthlyText, out decimal estimatedMonthlyBill);
+
+        DateTime lastUpdated;
+        if (DateTime.TryParse(lastUpdatedText, out DateTime parsedDate))
         {
+            lastUpdated = DateTime.SpecifyKind(parsedDate, DateTimeKind.Utc);
+        }
+        else
+        {
+            lastUpdated = DateTime.UtcNow;
         }
 
-        csvRows.Add($"\"{utility}\",\"{zip}\",\"{rateSchedule}\",\"{perKwh}\",\"{estimatedMonthly}\",\"{lastUpdated}\"");
+        var pricingPayload = new PtcPricingRequest
+        {
+            Utility = utility,
+            ZipCode = zip,
+            ServiceType = rateSchedule,
+            PricePerKwh = pricePerKwh,
+            EstimatedMonthlyBill = estimatedMonthlyBill,
+            LastUpdated = lastUpdated
+        };
+
+        var postResponse = await apiHttpClient.PostAsJsonAsync("api/PTCPricingProcess/pricing-result", pricingPayload);
+
+        if (postResponse.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"  Successfully saved pricing to database for Zip: {zip}, Utility: {utility}");
+        }
+        else
+        {
+            var errorContent = await postResponse.Content.ReadAsStringAsync();
+            Console.WriteLine($"  Failed to save pricing to database via API for Zip: {zip}. Error: {errorContent}");
+        }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"  Failed to scrape price data for {zip}: {ex.Message}");
+        Console.WriteLine($"  Failed to scrape or save price data for {zip}: {ex.Message}");
     }
+}
+
+public class CustomerLeadDto
+{
+    public string ZipCode { get; set; } = string.Empty;
+    public string UtilityProvider { get; set; } = string.Empty;
+}
+
+public class PtcPricingRequest
+{
+    public string Utility { get; set; } = string.Empty;
+    public string ZipCode { get; set; } = string.Empty;
+    public string ServiceType { get; set; } = string.Empty;
+    public decimal PricePerKwh { get; set; }
+    public decimal EstimatedMonthlyBill { get; set; }
+    public DateTime LastUpdated { get; set; }
 }

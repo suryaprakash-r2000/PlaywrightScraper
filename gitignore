@@ -1,0 +1,47 @@
+# Build results
+bin/
+obj/
+out/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# NuGet
+*.nupkg
+*.snupkg
+**/packages/*
+!**/packages/build/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Playwright
+node_modules/
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+bin/Debug/**/.playwright/
+
+# Logs and output data
+*.log
+PowerRates.csv
+Error_*.png
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+*.pfx
+*.key
+
+# Rider
+*.DotSettings.user
