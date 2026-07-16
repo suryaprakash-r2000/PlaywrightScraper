@@ -1,19 +1,27 @@
-﻿using Microsoft.Playwright;
+﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Playwright;
 using System.Collections.Concurrent;
-using System.Text;
 using System.Net.Http.Json;
-using Microsoft.Extensions.Configuration;
+using System.Text;
+
+string environment =
+    Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT")
+    ?? Environments.Production;
 
 var configuration = new ConfigurationBuilder()
     .SetBasePath(Directory.GetCurrentDirectory())
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+    .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: true)
+    .AddEnvironmentVariables()
     .Build();
 
-string baseApiUrl = configuration["ScraperSettings:BaseApiUrl"] ?? "https://localhost:32768";
-string stateToProcess = configuration["ScraperSettings:StateToProcess"] ?? "PA";
-string targetRateSchedule = configuration["ScraperSettings:TargetRateSchedule"] ?? "Regular Residential Service";
-string homeUrl = configuration["ScraperSettings:HomeUrl"] ?? "https://www.papowerswitch.com/";
-int maxConcurrency = int.TryParse(configuration["ScraperSettings:MaxConcurrency"], out var parsedMax) ? parsedMax : 5;
+string baseApiUrl = configuration["ScraperSettings:BaseApiUrl"]!;
+string stateToProcess = configuration["ScraperSettings:StateToProcess"]!;
+string targetRateSchedule = configuration["ScraperSettings:TargetRateSchedule"]!;
+string homeUrl = configuration["ScraperSettings:HomeUrl"]!;
+
+int maxConcurrency = configuration.GetValue<int>("ScraperSettings:MaxConcurrency", 5);
 
 var csvRows = new ConcurrentBag<string>();
 using var httpClient = new HttpClient { BaseAddress = new Uri(baseApiUrl), Timeout = TimeSpan.FromSeconds(30) };
